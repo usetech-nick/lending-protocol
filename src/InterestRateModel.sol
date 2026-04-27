@@ -5,9 +5,9 @@ import {IInterestRateModel} from "./interfaces/IInterestRateModel.sol";
 
 contract InterestRateModel is IInterestRateModel {
     uint256 public immutable kink;
+    uint256 public immutable baseRate;
     uint256 public immutable slope1;
     uint256 public immutable slope2;
-    uint256 public immutable baseRate;
 
     uint256 public constant RAY = 1e27;
 

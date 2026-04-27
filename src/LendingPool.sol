@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IInterestRateModel} from "./interfaces/IInterestRateModel.sol";
+import {ILiquidationEngine} from "./interfaces/ILiquidationEngine.sol";
+import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+struct ReserveData {
+    uint256 totalDeposits; // total principal deposited
+    uint256 totalBorrows; // total principal borrowed
+    uint256 borrowIndex; // grows at borrowRate — tracks debt accrual
+    uint256 depositIndex; // grows at supplyRate — tracks deposit yield
+    uint256 lastUpdatedTimestamp;
+    uint256 ltv; // max borrow % e.g. 0.8e27 = 80%
+    uint256 liquidationThreshold; // HF drops below 1 when debt > collateral * this
+    uint256 liquidationBonus; // extra % liquidator receives e.g. 0.05e27 = 5%
+    bool isActive;
+}
+
+contract LendingPool {
+    using SafeERC20 for IERC20;
+
+    // ── state ──────────────────────────────────────────────────────────────
+
+    mapping(address => ReserveData) public reserves;
+
+    mapping(address => mapping(address => uint256)) public userDeposits; // user → token → principal deposited
+    mapping(address => mapping(address => uint256)) public userBorrows; // user → token → principal borrowed
+    mapping(address => mapping(address => uint256)) public userDebtIndex; // user → token → borrowIndex at borrow time
+    mapping(address => mapping(address => uint256)) public userDepositIndex; // user → token → depositIndex at deposit time
+
+    // ── constants & immutables ─────────────────────────────────────────────
+
+    uint256 public constant RAY = 1e27;
+
+    address public immutable WETH;
+    address public immutable USDC;
+
+    IInterestRateModel public immutable interestRateModel;
+    IPriceOracle public immutable priceOracle;
+    ILiquidationEngine public immutable liquidationEngine;
+
+    // ── events ─────────────────────────────────────────────────────────────
+
+    event Deposit(address indexed user, address indexed token, uint256 amount);
+    event Withdraw(address indexed user, address indexed token, uint256 amount);
+    event Borrow(address indexed user, address indexed token, uint256 amount);
+    event Repay(address indexed user, address indexed token, uint256 amount);
+    event ReserveInitialized(address indexed token);
+
+    // ── errors ─────────────────────────────────────────────────────────────
+
+    error ReserveNotActive();
+    error InsufficientCollateral();
+    error InsufficientLiquidity();
+    error InvalidAmount();
+    error InvalidToken();
+
+    // ── constructor ────────────────────────────────────────────────────────
+
+    constructor(
+        address _interestRateModel,
+        address _priceOracle,
+        address _liquidationEngine,
+        address _weth,
+        address _usdc
+    ) {
+        interestRateModel = IInterestRateModel(_interestRateModel);
+        priceOracle = IPriceOracle(_priceOracle);
+        liquidationEngine = ILiquidationEngine(_liquidationEngine);
+        WETH = _weth;
+        USDC = _usdc;
+    }
+
+    // ── reserve initialization ─────────────────────────────────────────────
+
+    function initReserve(address token, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus) external {
+        ReserveData storage reserve = reserves[token];
+        reserve.borrowIndex = RAY; // start at 1.0
+        reserve.depositIndex = RAY; // start at 1.0
+        reserve.lastUpdatedTimestamp = block.timestamp;
+        reserve.ltv = ltv;
+        reserve.liquidationThreshold = liquidationThreshold;
+        reserve.liquidationBonus = liquidationBonus;
+        reserve.isActive = true;
+        emit ReserveInitialized(token);
+    }
+
+    // ── internal: index update ─────────────────────────────────────────────
+
+    function _updateReserveIndex(address token) internal {
+        ReserveData storage reserve = reserves[token];
+
+        uint256 timeElapsed = block.timestamp - reserve.lastUpdatedTimestamp;
+        if (timeElapsed == 0) return;
+
+        if (reserve.totalDeposits > 0) {
+            uint256 borrowRate = interestRateModel.getBorrowRate(reserve.totalBorrows, reserve.totalDeposits);
+
+            uint256 utilization = (reserve.totalBorrows * RAY) / reserve.totalDeposits;
+            uint256 supplyRate = (borrowRate * utilization) / RAY;
+
+            reserve.borrowIndex = reserve.borrowIndex * (RAY + borrowRate * timeElapsed) / RAY;
+            reserve.depositIndex = reserve.depositIndex * (RAY + supplyRate * timeElapsed) / RAY;
+        }
+
+        reserve.lastUpdatedTimestamp = block.timestamp;
+    }
+
+    // ── internal: actual balance helpers ──────────────────────────────────
+
+    function _actualDebt(address user, address token) internal view returns (uint256) {
+        if (userBorrows[user][token] == 0) return 0;
+        return userBorrows[user][token] * reserves[token].borrowIndex / userDebtIndex[user][token];
+    }
+
+    function _actualDeposit(address user, address token) internal view returns (uint256) {
+        if (userDeposits[user][token] == 0) return 0;
+        return userDeposits[user][token] * reserves[token].depositIndex / userDepositIndex[user][token];
+    }
+
+    // ── internal: health factor ────────────────────────────────────────────
+
+    function _healthFactor(address user) internal view returns (uint256) {
+        uint256 collateralUSD = _actualDeposit(user, WETH) * priceOracle.getPrice(WETH) / 1e18;
+
+        uint256 debtUSD = _actualDebt(user, USDC) * priceOracle.getPrice(USDC) / 1e6;
+
+        if (debtUSD == 0) return type(uint256).max;
+
+        return (collateralUSD * reserves[WETH].liquidationThreshold / RAY) * RAY / debtUSD;
+    }
+
+    // ── external functions (stubs — to be implemented) ────────────────────
+
+    function deposit(address token, uint256 amount) external {
+        _updateReserveIndex(token);
+        // TODO
+    }
+
+    function withdraw(address token, uint256 amount) external {
+        _updateReserveIndex(token);
+        // TODO
+    }
+
+    function borrow(address token, uint256 amount) external {
+        _updateReserveIndex(token);
+        // TODO
+    }
+
+    function repay(address token, uint256 amount) external {
+        _updateReserveIndex(token);
+        // TODO
+    }
+
+    // ── external: view ────────────────────────────────────────────────────
+
+    function healthFactor(address user) external view returns (uint256) {
+        return _healthFactor(user);
+    }
+
+    function actualDebt(address user, address token) external view returns (uint256) {
+        return _actualDebt(user, token);
+    }
+
+    function actualDeposit(address user, address token) external view returns (uint256) {
+        return _actualDeposit(user, token);
+    }
+}
