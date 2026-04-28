@@ -26,10 +26,8 @@ contract LendingPool {
 
     mapping(address => ReserveData) public reserves;
 
-    mapping(address => mapping(address => uint256)) public userDeposits; // user → token → principal deposited
-    mapping(address => mapping(address => uint256)) public userBorrows; // user → token → principal borrowed
-    mapping(address => mapping(address => uint256)) public userDebtIndex; // user → token → borrowIndex at borrow time
-    mapping(address => mapping(address => uint256)) public userDepositIndex; // user → token → depositIndex at deposit time
+    mapping(address => mapping(address => uint256)) public userDeposits; // user → token → scaled deposit
+    mapping(address => mapping(address => uint256)) public userBorrows; // user → token → scaled borrow
 
     // ── constants & immutables ─────────────────────────────────────────────
 
@@ -52,11 +50,11 @@ contract LendingPool {
 
     // ── errors ─────────────────────────────────────────────────────────────
 
-    error ReserveNotActive();
-    error InsufficientCollateral();
-    error InsufficientLiquidity();
-    error InvalidAmount();
-    error InvalidToken();
+    error LendingPool__ReserveNotActive();
+    error LendingPool__InsufficientCollateral();
+    error LendingPool__InsufficientLiquidity();
+    error LendingPool__InvalidAmount();
+    error LendingPool__InvalidToken();
 
     // ── constructor ────────────────────────────────────────────────────────
 
@@ -111,16 +109,13 @@ contract LendingPool {
 
     // ── internal: actual balance helpers ──────────────────────────────────
 
-    function _actualDebt(address user, address token) internal view returns (uint256) {
-        if (userBorrows[user][token] == 0) return 0;
-        return userBorrows[user][token] * reserves[token].borrowIndex / userDebtIndex[user][token];
-    }
-
     function _actualDeposit(address user, address token) internal view returns (uint256) {
-        if (userDeposits[user][token] == 0) return 0;
-        return userDeposits[user][token] * reserves[token].depositIndex / userDepositIndex[user][token];
+        return userDeposits[user][token] * reserves[token].depositIndex / RAY;
     }
 
+    function _actualDebt(address user, address token) internal view returns (uint256) {
+        return userBorrows[user][token] * reserves[token].borrowIndex / RAY;
+    }
     // ── internal: health factor ────────────────────────────────────────────
 
     function _healthFactor(address user) internal view returns (uint256) {
@@ -136,8 +131,30 @@ contract LendingPool {
     // ── external functions (stubs — to be implemented) ────────────────────
 
     function deposit(address token, uint256 amount) external {
+        // 1. validate
+        //    - amount must be > 0
+        //    - token must be WETH (only collateral accepted)
+        //    - reserve must be active
+        if (amount == 0) revert LendingPool__InvalidAmount();
+        if (token != WETH) revert LendingPool__InvalidToken();
+        if (!reserves[token].isActive) revert LendingPool__ReserveNotActive();
+
+        // 2. update index (already stubbed)
         _updateReserveIndex(token);
-        // TODO
+
+        // 3. transfer WETH from user → contract
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+        // 4. update user state
+        //    - userDeposits[user][token] += amount
+        userDeposits[msg.sender][token] += amount * RAY / reserves[token].depositIndex; // scale by depositIndex
+
+        // 5. update reserve state
+        //    - reserve.totalDeposits += amount
+        reserves[token].totalDeposits += amount;
+
+        // 6. emit Deposit
+        emit Deposit(msg.sender, token, amount);
     }
 
     function withdraw(address token, uint256 amount) external {
