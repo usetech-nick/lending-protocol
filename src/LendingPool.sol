@@ -6,6 +6,8 @@ import {ILiquidationEngine} from "./interfaces/ILiquidationEngine.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 struct ReserveData {
     uint256 totalDeposits; // total principal deposited
@@ -19,7 +21,7 @@ struct ReserveData {
     bool isActive;
 }
 
-contract LendingPool {
+contract LendingPool is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ── state ──────────────────────────────────────────────────────────────
@@ -64,7 +66,7 @@ contract LendingPool {
         address _liquidationEngine,
         address _weth,
         address _usdc
-    ) {
+    ) Ownable(msg.sender) {
         interestRateModel = IInterestRateModel(_interestRateModel);
         priceOracle = IPriceOracle(_priceOracle);
         liquidationEngine = ILiquidationEngine(_liquidationEngine);
@@ -74,7 +76,10 @@ contract LendingPool {
 
     // ── reserve initialization ─────────────────────────────────────────────
 
-    function initReserve(address token, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus) external {
+    function initReserve(address token, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus)
+        external
+        onlyOwner
+    {
         ReserveData storage reserve = reserves[token];
         reserve.borrowIndex = RAY; // start at 1.0
         reserve.depositIndex = RAY; // start at 1.0
@@ -116,6 +121,7 @@ contract LendingPool {
     function _actualDebt(address user, address token) internal view returns (uint256) {
         return userBorrows[user][token] * reserves[token].borrowIndex / RAY;
     }
+
     // ── internal: health factor ────────────────────────────────────────────
 
     function _healthFactor(address user) internal view returns (uint256) {
@@ -125,12 +131,12 @@ contract LendingPool {
 
         if (debtUSD == 0) return type(uint256).max;
 
-        return (collateralUSD * reserves[WETH].liquidationThreshold / RAY) * RAY / debtUSD;
+        return collateralUSD * reserves[WETH].liquidationThreshold / debtUSD;
     }
 
     // ── external functions (stubs — to be implemented) ────────────────────
 
-    function deposit(address token, uint256 amount) external {
+    function deposit(address token, uint256 amount) external nonReentrant {
         // 1. validate
         //    - amount must be > 0
         //    - token must be WETH (only collateral accepted)
@@ -142,32 +148,67 @@ contract LendingPool {
         // 2. update index (already stubbed)
         _updateReserveIndex(token);
 
-        // 3. transfer WETH from user → contract
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-
-        // 4. update user state
+        // 3. update user state
         //    - userDeposits[user][token] += amount
         userDeposits[msg.sender][token] += amount * RAY / reserves[token].depositIndex; // scale by depositIndex
 
-        // 5. update reserve state
+        // 4. update reserve state
         //    - reserve.totalDeposits += amount
         reserves[token].totalDeposits += amount;
+
+        // 5. transfer WETH from user → contract
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
         // 6. emit Deposit
         emit Deposit(msg.sender, token, amount);
     }
 
-    function withdraw(address token, uint256 amount) external {
+    function withdraw(address token, uint256 amount) external nonReentrant {
         _updateReserveIndex(token);
         // TODO
     }
 
-    function borrow(address token, uint256 amount) external {
+    function borrow(address token, uint256 amount) external nonReentrant {
+        // 1. validate
+        //    - amount > 0
+        //    - token must be USDC (only borrowable asset)
+        //    - reserve must be active
+        if (amount == 0) revert LendingPool__InvalidAmount();
+        if (token != USDC) revert LendingPool__InvalidToken();
+        if (!reserves[token].isActive) revert LendingPool__ReserveNotActive();
+
+        // 2. update index
         _updateReserveIndex(token);
-        // TODO
+
+        // 3. check pool has enough USDC liquidity
+        //    reserve.totalDeposits - reserve.totalBorrows >= amount
+        if (reserves[token].totalDeposits - reserves[token].totalBorrows < amount) {
+            revert LendingPool__InsufficientLiquidity();
+        }
+
+        // 4. scale and update user borrow
+        //    userBorrows[msg.sender][token] += amount * RAY / reserve.borrowIndex
+        userBorrows[msg.sender][token] += amount * RAY / reserves[token].borrowIndex; // scale by borrowIndex
+
+        // 5. update reserve
+        //    reserve.totalBorrows += amount
+        reserves[token].totalBorrows += amount;
+
+        // 6. health factor check AFTER updating state
+        //    if (_healthFactor(msg.sender) < RAY) revert
+        if (_healthFactor(msg.sender) < RAY) {
+            // revert if HF < 1.0
+            revert LendingPool__InsufficientCollateral();
+        }
+
+        // 7. transfer USDC out to user
+        IERC20(token).safeTransfer(msg.sender, amount);
+
+        // 8. emit Borrow
+        emit Borrow(msg.sender, token, amount);
     }
 
-    function repay(address token, uint256 amount) external {
+    function repay(address token, uint256 amount) external nonReentrant {
         _updateReserveIndex(token);
         // TODO
     }
