@@ -164,8 +164,32 @@ contract LendingPool is Ownable, ReentrancyGuard {
     }
 
     function withdraw(address token, uint256 amount) external nonReentrant {
+        // 1. validate
+        if (amount == 0) revert LendingPool__InvalidAmount();
+        if (token != WETH) revert LendingPool__InvalidToken();
+        if (!reserves[token].isActive) revert LendingPool__ReserveNotActive();
+
+        // 2. update index
         _updateReserveIndex(token);
-        // TODO
+
+        // 3.compute actual deposit — cap withdraw amount at full deposit so user can't overdraw
+        uint256 actualDeposit = _actualDeposit(msg.sender, token);
+        uint256 withdrawAmount = amount > actualDeposit ? actualDeposit : amount;
+
+        // 4. compute scaled amount to reduce userDeposits
+        userDeposits[msg.sender][token] -= withdrawAmount * RAY / reserves[token].depositIndex;
+
+        // 5. reduce reserve.totalDeposits
+        reserves[token].totalDeposits -= withdrawAmount;
+        // 6. health factor check AFTER updating state — user can't withdraw so much that their remaining collateral can't cover their debt
+        if (_healthFactor(msg.sender) < RAY) {
+            revert LendingPool__InsufficientCollateral();
+        }
+        // 7. transfer WETH out to user
+        IERC20(token).safeTransfer(msg.sender, withdrawAmount);
+
+        // 8. emit Withdraw
+        emit Withdraw(msg.sender, token, withdrawAmount);
     }
 
     function borrow(address token, uint256 amount) external nonReentrant {
@@ -209,8 +233,28 @@ contract LendingPool is Ownable, ReentrancyGuard {
     }
 
     function repay(address token, uint256 amount) external nonReentrant {
+        // 1. validate amount > 0, token == USDC, reserve active
+        if (amount == 0) revert LendingPool__InvalidAmount();
+        if (token != USDC) revert LendingPool__InvalidToken();
+        if (!reserves[token].isActive) revert LendingPool__ReserveNotActive();
+
+        // 2. _updateReserveIndex(token)
         _updateReserveIndex(token);
-        // TODO
+
+        // 3. compute actual debt, cap repay amount at full debt so user can't overpay
+        uint256 actualDebt = _actualDebt(msg.sender, token);
+        uint256 repayAmount = amount > actualDebt ? actualDebt : amount;
+
+        // 4. scale the capped amount and reduce userBorrows
+        userBorrows[msg.sender][token] -= repayAmount * RAY / reserves[token].borrowIndex; // scale by borrowIndex
+
+        // 5. reduce reserve.totalBorrows
+        reserves[token].totalBorrows -= repayAmount;
+
+        // 6. transfer USDC from user → contract
+        IERC20(token).safeTransferFrom(msg.sender, address(this), repayAmount);
+        // emit Repay
+        emit Repay(msg.sender, token, amount);
     }
 
     // ── external: view ────────────────────────────────────────────────────
